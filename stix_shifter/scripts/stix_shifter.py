@@ -1,16 +1,24 @@
 import argparse
 import sys
-from stix_shifter.stix_translation import stix_translation
-from stix_shifter.stix_transmission import stix_transmission
-from flask import Flask
 import json
 import time
-from stix_shifter.utils.proxy_host import ProxyHost
+import importlib
+from flask import Flask
+import logging
+import copy
+from stix_shifter.stix_translation import stix_translation
+from stix_shifter.stix_transmission import stix_transmission
+from stix_shifter_utils.utils.proxy_host import ProxyHost
+from stix_shifter_utils.utils.module_discovery import process_dialects, modules_list
+from stix_shifter_utils.utils import logger as utils_logger
+from stix_shifter_utils.utils.logger import exception_to_string
 
 TRANSLATE = 'translate'
 TRANSMIT = 'transmit'
 EXECUTE = 'execute'
 HOST = 'host'
+MAPPING = 'mapping'
+MODULES = 'modules'
 
 
 def main():
@@ -23,8 +31,7 @@ def main():
     The module and translate_type will determine what module and method gets executed.
     Option arguments comes in as:
       "{
-          "select_fields": <string array of fields in the datasource select statement> (In the case of QRadar),
-          "mapping": <mapping hash for either stix pattern to datasource or mapping hash for data results to stix observation objects>,
+          "mapping": <mapping hash for stix pattern to datasource and data results to stix observation objects>,
           "resultSizeLimit": <integer limit number for max results in the data source query>,
           "timeRange": <integer time range for LAST x MINUTES used in the data source query when START STOP qualifiers are absent>
        }"
@@ -50,7 +57,8 @@ def main():
 
     # positional arguments
     translate_parser.add_argument(
-        'module', choices=stix_translation.TRANSLATION_MODULES, help='The translation module to use')
+        'module',
+         help='The translation module to use')
     translate_parser.add_argument('translate_type', choices=[
         stix_translation.RESULTS, stix_translation.QUERY, stix_translation.PARSE], help='The translation action to perform')
     translate_parser.add_argument(
@@ -63,9 +71,16 @@ def main():
     # optional arguments
     translate_parser.add_argument('-x', '--stix-validator', action='store_true',
                                   help='Run the STIX 2 validator against the translated results')
-    # Only supported by Elastic and Splunk
-    translate_parser.add_argument('-m', '--data-mapper',
-                                  help='optional module to use for Splunk or Elastic STIX-to-query mapping')
+    translate_parser.add_argument('-d', '--debug', action='store_true',
+                                  help='Print detail logs for debugging')
+    # modules parser
+    parent_subparsers.add_parser(MODULES, help='Get modules list')
+
+    # mapping parser
+    mapping_parser = parent_subparsers.add_parser(
+        MAPPING, help='Get module mapping')
+    # positional arguments
+    mapping_parser.add_argument('module', help='The translation module to use')
 
     # transmit parser
     transmit_parser = parent_subparsers.add_parser(
@@ -73,7 +88,7 @@ def main():
 
     # positional arguments
     transmit_parser.add_argument(
-        'module', choices=stix_transmission.TRANSMISSION_MODULES,
+        'module', 
         help='Choose which connection module to use'
     )
     transmit_parser.add_argument(
@@ -86,31 +101,37 @@ def main():
         type=str,
         help='Data source authentication'
     )
+    transmit_parser.add_argument('-d', '--debug', action='store_true',
+                                  help='Print detail logs for debugging')
 
     # operation subparser
     operation_subparser = transmit_parser.add_subparsers(title="operation", dest="operation_command")
     operation_subparser.add_parser(stix_transmission.PING, help="Pings the data source")
     query_operation_parser = operation_subparser.add_parser(stix_transmission.QUERY, help="Executes a query on the data source")
     query_operation_parser.add_argument('query_string', help='native datasource query string')
+    query_operation_parser.add_argument('-d', '--debug', action='store_true', help='Print detail logs for debugging')
     results_operation_parser = operation_subparser.add_parser(stix_transmission.RESULTS, help="Fetches the results of the data source query")
     results_operation_parser.add_argument('search_id', help='uuid of executed query')
     results_operation_parser.add_argument('offset', help='offset of results')
     results_operation_parser.add_argument('length', help='length of results')
+    results_operation_parser.add_argument('-d', '--debug', action='store_true', help='Print detail logs for debugging')
     status_operation_parser = operation_subparser.add_parser(stix_transmission.STATUS, help="Gets the current status of the query")
     status_operation_parser.add_argument('search_id', help='uuid of executed query')
+    status_operation_parser.add_argument('-d', '--debug', action='store_true', help='Print detail logs for debugging')
     delete_operation_parser = operation_subparser.add_parser(stix_transmission.DELETE, help="Delete a running query on the data source")
     delete_operation_parser.add_argument('search_id', help='id of query to remove')
+    delete_operation_parser.add_argument('-d', '--debug', action='store_true', help='Print detail logs for debugging')
     operation_subparser.add_parser(stix_transmission.IS_ASYNC, help='Checks if the query operation is asynchronous')
 
     execute_parser = parent_subparsers.add_parser(EXECUTE, help='Translate and fully execute a query')
     # positional arguments
     execute_parser.add_argument(
-        'transmission_module', choices=stix_transmission.TRANSMISSION_MODULES,
+        'transmission_module',
         help='Which connection module to use'
     )
     execute_parser.add_argument(
-        'translation_module', choices=stix_translation.TRANSLATION_MODULES,
-        help='Which translation module to use'
+        'module',
+        help='Which translation module to use for translation'
     )
     execute_parser.add_argument(
         'data_source',
@@ -132,6 +153,8 @@ def main():
         type=str,
         help='Query String'
     )
+    execute_parser.add_argument('-d', '--debug', action='store_true',
+                                help='Print detail logs for debugging')
 
     host_parser = parent_subparsers.add_parser(HOST, help='Host a local query service, for testing and development')
     host_parser.add_argument(
@@ -144,13 +167,40 @@ def main():
         type=str,
         help='Proxy Host:Port'
     )
+    host_parser.add_argument('-d', '--debug', action='store_true',
+                                help='Print detail logs for debugging')
 
     args = parent_parser.parse_args()
 
-    if args.command is None:
+    help_and_exit = args.command is None
+
+    if 'debug' in args and args.debug:
+        utils_logger.init(logging.DEBUG)
+    else:
+        utils_logger.init(logging.INFO)
+
+    log = utils_logger.set_logger(__name__)
+
+    if 'module' in args:
+        args_module_dialects = args.module
+
+        options = {}
+        if 'options' in args and args.options:
+            options = json.loads(args.options)
+
+        module = process_dialects(args_module_dialects, options)[0]
+
+        try:
+            importlib.import_module("stix_shifter_modules." + module + ".entry_point")
+        except Exception as ex:
+            log.debug(exception_to_string(ex))
+            log.error('Module {} not found'.format(module))
+            log.debug(exception_to_string(ex))
+            help_and_exit = True
+
+    if help_and_exit:
         parent_parser.print_help(sys.stderr)
         sys.exit(1)
-
     elif args.command == HOST:
         # Host means to start a local web service for STIX shifter, to use in combination with the proxy data source
         # module. This combination allows one to run and debug their stix-shifter code locally, while interacting with
@@ -189,9 +239,9 @@ def main():
             return host.delete_query_connection()
 
         @app.route('/ping', methods=['POST'])
-        def ping():
+        def ping_connection():
             host = ProxyHost()
-            return host.ping()
+            return host.ping_connection()
 
         @app.route('/is_async', methods=['POST'])
         def is_async():
@@ -199,21 +249,26 @@ def main():
             return host.is_async()
 
         host_address = args.host_address.split(":")
-        app.run(debug=True, port=int(host_address[1]), host=host_address[0])
+        app.run(debug=False, port=int(host_address[1]), host=host_address[0])
 
     elif args.command == EXECUTE:
         # Execute means take the STIX SCO pattern as input, execute query, and return STIX as output
+        
         translation = stix_translation.StixTranslation()
-        dsl = translation.translate(args.translation_module, 'query', args.data_source, args.query, {'validate_pattern': True})
         connection_dict = json.loads(args.connection)
         configuration_dict = json.loads(args.configuration)
-
+        translation_options = copy.deepcopy(connection_dict.get('options', {}))
+        options['validate_pattern'] = True
+        dsl = translation.translate(args.module, 'query', args.data_source, args.query, translation_options)
         transmission = stix_transmission.StixTransmission(args.transmission_module, connection_dict, configuration_dict)
 
+        transmission = stix_transmission.StixTransmission(args.transmission_module, connection_dict, configuration_dict)
         results = []
+        if not 'queries' in dsl:
+            print(json.dumps(dsl, indent=4))
+            exit(1)
         for query in dsl['queries']:
             search_result = transmission.query(query)
-
             if search_result["success"]:
                 search_id = search_result["search_id"]
 
@@ -222,42 +277,56 @@ def main():
                     status = transmission.status(search_id)
                     if status['success']:
                         while status['progress'] < 100 and status['status'] == 'RUNNING':
-                            print(status)
+                            log.debug(status)
                             status = transmission.status(search_id)
-                        print(status)
+                        log.debug(status)
                     else:
                         raise RuntimeError("Fetching status failed")
                 result = transmission.results(search_id, 0, 9)
                 if result["success"]:
-                    print("Search {} results is:\n{}".format(search_id, result["data"]))
+                    log.debug("Search {} results is:\n{}".format(search_id, result["data"]))
 
                     # Collect all results
                     results += result["data"]
                 else:
                     raise RuntimeError("Fetching results failed; see log for details")
             else:
-                raise RuntimeError("Search failed to execute; see log for details")
+                log.error(str(search_result))
+                exit(0)
 
         # Translate results to STIX
-        result = translation.translate(args.translation_module, 'results', args.data_source, json.dumps(results), {"stix_validator": True})
-        print(result)
-
+        translation_options = copy.deepcopy(connection_dict.get('options', {}))
+        options['validate_pattern'] = True
+        result = translation.translate(args.module, 'results', args.data_source, json.dumps(results), translation_options)
+        print(json.dumps(result, indent=4, sort_keys=False))
         exit(0)
 
     elif args.command == TRANSLATE:
-        options = json.loads(args.options) if bool(args.options) else {}
+        data = args.data
+        if not data:
+            data_lines = []
+            for line in sys.stdin:
+                data_lines.append(line)
+            data = '\n'.join(data_lines)
         if args.stix_validator:
             options['stix_validator'] = args.stix_validator
-        if args.data_mapper:
-            options['data_mapper'] = args.data_mapper
         recursion_limit = args.recursion_limit if args.recursion_limit else 1000
         translation = stix_translation.StixTranslation()
         result = translation.translate(
-            args.module, args.translate_type, args.data_source, args.data, options=options, recursion_limit=recursion_limit)
+            args.module, args.translate_type, args.data_source, data, options=options, recursion_limit=recursion_limit)
+    elif args.command == MAPPING:
+        translation = stix_translation.StixTranslation()
+        result = translation.translate(args.module, stix_translation.MAPPING, None, None, options=options)
+    elif args.command == MODULES:
+        translation = stix_translation.StixTranslation()
+        result = {}
+        all_modules = modules_list()
+        for m in all_modules:
+            result[m] = translation.translate(m, stix_translation.DIALECTS, None, None)
     elif args.command == TRANSMIT:
         result = transmit(args)  # stix_transmission
 
-    print(result)
+    print(json.dumps(result, indent=4, sort_keys=False))
     exit(0)
 
 
@@ -265,7 +334,7 @@ def transmit(args):
     """
     Connects to datasource and executes a query, grabs status update or query results
     :param args:
-    args: <module> '{"host": <host IP>, "port": <port>, "cert": <certificate>}', '{"auth": <authentication>}',
+    args: <module> '{"host": <host IP>, "port": <port>, "selfSignedCert": <certificate>}', '{"auth": <authentication>}',
     <
         query <query string>,
         status <search id>,

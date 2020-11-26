@@ -1,205 +1,242 @@
-"""A setuptools based setup module.
-
-See:
-https://packaging.python.org/en/latest/distributing.html
-https://github.com/pypa/sampleproject
-"""
-
-# Always prefer setuptools over distutils
-from setuptools import setup, find_packages
+from setuptools import find_packages
 # To use a consistent encoding
 from codecs import open
-from os import path
+import sys
+import shutil
+import subprocess
+import json
+import io
+import os
+from jsonmerge import merge
+import tempfile
+import importlib
 
-here = path.abspath(path.dirname(__file__))
+here = os.path.abspath(os.path.dirname(__file__))
+SKIP_ME = 'SKIP.ME'
 
-# Get the long description from the README file
-with open(path.join(here, 'README.md'), encoding='utf-8') as f:
+with open(os.path.join(here, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
-# Arguments marked as "Required" below must be included for upload to PyPI.
-# Fields marked as "Optional" may be commented out.
+TMP_MAPPING_DIR = 'tmp_mapping'
+MODULES_DIR = 'stix_shifter_modules'
+if os.path.isdir(TMP_MAPPING_DIR):
+    shutil.rmtree(TMP_MAPPING_DIR)
 
-setup(
-    # This is the name of your project. The first time you publish this
-    # package, this name will be registered for you. It will determine how
-    # users can install this project, e.g.:
-    #
-    # $ pip install sampleproject
-    #
-    # And where it will live on PyPI: https://pypi.org/project/sampleproject/
-    #
-    # There are some restrictions on what makes a valid project name
-    # specification here:
-    # https://packaging.python.org/specifications/core-metadata/#name
-    name='stix_shifter',  # Required
+os.mkdir(TMP_MAPPING_DIR)
 
-    # Versions should comply with PEP 440:
-    # https://www.python.org/dev/peps/pep-0440/
-    #
-    # For a discussion on single-sourcing the version across setup.py and the
-    # project code, see
-    # https://packaging.python.org/en/latest/single_source_version.html
-    version='1.0.0',  # Required
+for module in [o for o in os.listdir(MODULES_DIR) if (os.path.isdir(os.path.join(MODULES_DIR,o)) and not o.startswith('_'))]:
+    if not os.path.isfile(os.path.join(MODULES_DIR, module, 'SKIP.ME')):
+        print(module + '..')
+        connector_module = importlib.import_module("stix_shifter_modules." + module + ".entry_point")
+        entry_point = connector_module.EntryPoint()
+        mapping = entry_point.get_mapping()
+        with open(os.path.join(TMP_MAPPING_DIR, module+'.json'), 'w', encoding="utf-8") as f:
+            json.dump(mapping, f, sort_keys=False, indent=4)
 
-    # This is a one-line description or tagline of what your project does. This
-    # corresponds to the "Summary" metadata field:
-    # https://packaging.python.org/specifications/core-metadata/#summary
-    description='Tools and interface to translate STIX formatted results and queries to different data source formats and to set up appropriate connection strings for invoking and triggering actions in openwhisk',  # Required
+def fill_connectors(projects, modules_path):
+    modules = [name for name in os.listdir(modules_path)
+               if (os.path.isdir(os.path.join(modules_path, name)) and (not name.startswith('__')))]
+    for module in modules:
+        if not os.path.isfile(os.path.join(modules_path, module, SKIP_ME)):
+            projects['stix_shifter_modules_' + module] = ['stix_shifter_modules/' + module]
 
-    # This is an optional longer description of your project that represents
-    # the body of text which users will see when they visit PyPI.
-    #
-    # Often, this is the same as your README, so you can just read it in from
-    # that file directly (as we have already done above)
-    #
-    # This field corresponds to the "Description" metadata field:
-    # https://packaging.python.org/specifications/core-metadata/#description-optional
-    long_description=long_description,  # Optional
+# The mode determines how the stix-shifter is packaged
+# 1 = Include everything in 1 whl package
+# 3 - 3 whl packages respectively for stix-shifter, stix-shifter-utils and stix-shifter-modules
+# N - stix-shifter, stix-shifter-utils, and each connector is packaged separately
+# <module name> - package only the specified connector
 
-    # Denotes that our long_description is in Markdown; valid values are
-    # text/plain, text/x-rst, and text/markdown
-    #
-    # Optional if long_description is written in reStructuredText (rst) but
-    # required for plain-text or Markdown; if unspecified, "applications should
-    # attempt to render [the long_description] as text/x-rst; charset=UTF-8 and
-    # fall back to text/plain if it is not valid rst" (see link below)
-    #
-    # This field corresponds to the "Description-Content-Type" metadata field:
-    # https://packaging.python.org/specifications/core-metadata/#description-content-type-optional
-    long_description_content_type='text/markdown',  # Optional (see note above)
+mode = 'N'
+if 'MODE' in os.environ:
+    mode = os.environ['MODE']
 
-    # This should be a valid link to your project's main homepage.
-    #
-    # This field corresponds to the "Home-Page" metadata field:
-    # https://packaging.python.org/specifications/core-metadata/#home-page-optional
-    url='https://github.com/opencybersecurityalliance/stix-shifter',  # Optional
+# DO NOT remove spaces around the equal sign at the line below
+version = '1.0.0'
+if 'VERSION' in os.environ:
+    version = os.environ['VERSION']
 
-    # This should be your name or the name of the organization which owns the
-    # project.
-    author='ibm',  # Optional
+if mode == '1':
+    projects = {
+        "stix_shifter": [
+            'stix_shifter_utils',
+            'stix_shifter',
+            'stix_shifter_modules'
+            ]
+    }
+elif mode == '3':
+    projects = {
+        "stix_shifter_utils": ["stix_shifter_utils"],
+        "stix_shifter": ["stix_shifter"],
+        "stix_shifter_modules": ["stix_shifter_modules"],
+    }
+elif mode == 'N':
+    projects = {
+        "stix_shifter_utils": ["stix_shifter_utils"],
+        "stix_shifter": ["stix_shifter"],
+    }
+    fill_connectors(projects, "stix_shifter_modules")
+else:
+    module_path = 'stix_shifter_modules/' + mode
+    if os.path.isdir(module_path):
+        projects = {
+            "stix_shifter_modules_" + mode: [module_path]
+        }
+    else:
+        print('Unexpected value in MODE environment variable: %s' % mode)
+        print('Allowed values: 1|3|N|module_name')
+        exit(1)
 
-    # This should be a valid email address corresponding to the author listed
-    # above.
-    author_email='',  # Optional
+for project_name in projects.keys():
+    cleanup_file_list = []
+    temp_dir = None
+    module_dir = None
 
-    # Classifiers help users find your project by categorizing it.
-    #
-    # For a list of valid classifiers, see
-    # https://pypi.python.org/pypi?%3Aaction=list_classifiers
-    classifiers=[  # Optional
-        #     # How mature is this project? Common values are
-        #     #   3 - Alpha
-        #     #   4 - Beta
-        #     #   5 - Production/Stable
-        #     'Development Status :: 3 - Alpha',
+    src_folders = projects[project_name]
+    print('processing project_name %s' % project_name)
 
-        #     # Indicate who your project is intended for
-        #     'Intended Audience :: Developers',
-        #     'Topic :: Software Development :: Build Tools',
+    # Prepare packages
+    packages_include = []
+    for src_folder in src_folders:
+        packages_include.append(src_folder.replace('/', '.'))
+        packages_include.append(src_folder.replace('/', '.') + '.*')
+    print('packages_include: %s' % packages_include)
+    packages = find_packages(include=packages_include)
+    print('packages: %s' % packages)
 
-        #     # Pick your license as you wish
-         'License :: OSI Approved :: Apache Software License',
+    # Prepare requires list
+    install_requires = set()
+    requirements_files = []
+    for src_folder in src_folders:
+        for r, d, f in os.walk(src_folder):
+            for file in f:
+                if 'requirements.txt' == file and not os.path.isfile(os.path.join(r, SKIP_ME)):
+                    requirements_files.append(os.path.join(r, file))
+    print('requirements_files: %s' % requirements_files)
+    for requirements_file in requirements_files:
+        with open(requirements_file, encoding="utf-8") as f:
+            lines = f.readlines()
+        lines = [x.strip() for x in lines]
+        lines = list(filter(lambda s: (not s.startswith('#')) and len(s) > 0, lines))
+        install_requires.update(lines)
+    install_requires = list(install_requires)
+    print('install_requires: %s' % install_requires)
 
-        #     # Specify the Python versions you support here. In particular, ensure
-        #     # that you indicate whether you support Python 2, Python 3 or both.
-        #     'Programming Language :: Python :: 2',
-        #     'Programming Language :: Python :: 2.7',
-        #     'Programming Language :: Python :: 3',
-        #     'Programming Language :: Python :: 3.4',
-        #     'Programming Language :: Python :: 3.5',
-         'Programming Language :: Python :: 3.6',
-    ],
+    # Prepare entry points
+    entry_points = {}
+    entry_points_items = []
+    for src_folder in src_folders:
+        entry_point_path = os.path.join(src_folder, 'scripts', src_folder+'.py')
+        if os.path.exists(entry_point_path):
+            entry_points_items.append('%s=%s.scripts.%s:main' % (project_name.replace('_', '-'), project_name, project_name))
+    if len(entry_points_items) > 0:
+        entry_points = {  # Optional
+            'console_scripts': entry_points_items
+            }
+    print('entry_points: %s' % entry_points)
 
-    # This field adds keywords for your project which will appear on the
-    # project page. What does your project relate to?
-    #
-    # Note that this is a string of words separated by whitespace, not a list.
-    keywords='datasource stix translate transform transmit',  # Optional
-
-    # You can just specify package directories manually here if your project is
-    # simple. Or you can use find_packages().
-    #
-    # Alternatively, if you just want to distribute a single Python file, use
-    # the `py_modules` argument instead as follows, which will expect a file
-    # called `my_module.py` to exist:
-    #
-    #   py_modules=["my_module"],
-    #
-    packages=find_packages(exclude=['tests']),  # Required
-
-    # This field lists other packages that your project depends on to run.
-    # Any package you put here will be installed by pip when your project is
-    # installed, so they must be valid existing projects.
-    #
-    # For an analysis of "install_requires" vs pip's requirements files see:
-    # https://packaging.python.org/en/latest/requirements.html
-    install_requires=[
-        'stix2-patterns>=1.1.0',
-        'stix2-validator>=0.5.0',
-        'antlr4-python3-runtime==4.7',
-        'python-dateutil>=2.7.3',
-        'xmltodict>=0.11.0',
-        'requests_toolbelt==0.9.1',
-        'adal>=1.2.2',
-        'flatten_json==0.1.7',
-        'flask>=1.0.2'
-        # 'stix2-matcher@https://github.com/oasis-open/cti-pattern-matcher/archive/v0.1.0.zip#egg=stix2-matcher' # uncomment when running setup.py locally
-    ],
-
-    # List additional groups of dependencies here (e.g. development
-    # dependencies). Users will be able to install these using the "extras"
-    # syntax, for example:
-    #
-    #   $ pip install sampleproject[dev]
-    #
-    # Similar to `install_requires` above, these must be valid existing
-    # projects.
-    # extras_require={  # Optional
-    #     'dev': ['check-manifest'],
-    #     'test': ['coverage'],
-    # },
-
-    # If there are data files included in your packages that need to be
-    # installed, specify them here.
-    #
-    # If using Python 2.6 or earlier, then these have to be included in
-    # MANIFEST.in as well.
-    # package_data={  # Optional
-    #     'sample': ['package_data.dat'],
-    # },
-
-    # Although 'package_data' is the preferred approach, in some case you may
-    # need to place data files outside of your packages. See:
-    # http://docs.python.org/3.4/distutils/setupscript.html#installing-additional-files
-    #
-    # In this case, 'data_file' will be installed into '<sys.prefix>/my_data'
-    # data_files=[('my_data', ['*.json'])],  # Optional
-    include_package_data=True,
-
-    # To provide executable scripts, use entry points in preference to the
-    # "scripts" keyword. Entry points provide cross-platform support and allow
-    # `pip` to create the appropriate form of executable for the target
-    # platform.
-    #
-    # The following would provide a command called `stix-shifter` which
-    # executes the function `main` from this package when invoked:
-    entry_points={  # Optional
-        'console_scripts': [
-            'stix-shifter=stix_shifter.scripts.stix_shifter:main',
+    # Prepare setup params
+    params = {
+        'name': project_name,  # Required
+        'version': version,  # Required
+        'description': 'Tools and interface to translate STIX formatted results and queries to different data source '
+                       + 'formats and to set up appropriate connection strings for invoking and triggering actions '
+                       + 'in openwhisk',  # Required
+        'long_description': long_description,  # Optional
+        'long_description_content_type': 'text/markdown',
+                                         # Optional (see note above)
+        'url': 'https://github.com/opencybersecurityalliance/stix-shifter',  # Optional
+        'author': 'ibm',
+        'author_email': '',  # Optional
+        # https://pypi.python.org/pypi?%3Aaction=list_classifiers
+        'classifiers': [  # Optional
+            'License :: OSI Approved :: Apache Software License',
+            'Programming Language :: Python :: 3.6',
         ],
-    },
+        'keywords': 'datasource stix translate transform transmit',  # Optional
+        'packages': packages,  # Required
+        'install_requires': install_requires,
+        'include_package_data': True,
+        'entry_points': entry_points,  # Optional
+        'project_urls': {  # Optional
+            'Source': 'https://github.com/opencybersecurityalliance/stix-shifter',
+        },
+    }
 
-    # List additional URLs that are relevant to your project as a dict.
-    #
-    # This field corresponds to the "Project-URL" metadata fields:
-    # https://packaging.python.org/specifications/core-metadata/#project-url-multiple-use
-    #
-    # Examples listed include a pattern for specifying where the package tracks
-    # issues, where the source is hosted, where to say thanks to the package
-    # maintainers, and where to support the project financially. The key is
-    # what's used to render the link text on PyPI.
-    project_urls={  # Optional
-        'Source': 'https://github.com/opencybersecurityalliance/stix-shifter',
-    },
-)
+    # Prepare MANIFEST.in, include json files
+    shutil.rmtree('MANIFEST.in', ignore_errors=True)
+    shutil.copyfile('build_templates/MANIFEST.in', 'MANIFEST.in')
+    json_include_lines = []
+
+    for json_search_path in src_folders:
+        connector_name = ''
+        json_search_path_split = json_search_path.split(os.sep)
+        if len(json_search_path_split) > 1:
+            connector_name = json_search_path_split[1]
+        module_dir = json_search_path
+        configuration_path = os.path.join(module_dir, 'configuration')
+        if os.path.isdir(configuration_path):
+            conf_path = os.path.join(module_dir, 'conf')
+            shutil.rmtree(conf_path, ignore_errors=True)
+            os.mkdir(conf_path)
+            for r, d, f in os.walk(configuration_path):
+                for file in f:
+                    configuration_file_path = os.path.join(r, file)
+                    with open(configuration_file_path, encoding="utf-8") as json_file:
+                        module_data = json.load(json_file)
+                    base_data = None
+                    data = dict()
+                    base_path = os.path.join(r, '..', '..', file)
+                    if os.path.isfile(base_path):
+                        with open(base_path, encoding="utf-8") as json_file:
+                            base_data = json.load(json_file)
+                        data = base_data
+                    data = merge(module_data, data)
+                    if file == 'config.json':
+                        with open(os.path.join(TMP_MAPPING_DIR, connector_name+ '.json'), encoding="utf-8") as f:
+                            mapping = json.load(f)
+                            data['connection']['options']['mapping']['default'] = mapping
+                    json_file_path = os.path.join(r, '..', 'conf', file)
+                    with open(json_file_path, 'w') as json_file:
+                        json_file.write(json.dumps(data, indent=4, sort_keys=False))
+            connector_module = importlib.import_module("stix_shifter_modules." + connector_name + ".entry_point")
+            entry_point = connector_module.EntryPoint()
+            dialects_full = entry_point.get_dialects_full()
+            with open(os.path.join(conf_path, 'dialects.json'), 'w', encoding="utf-8") as f:
+                f.write(json.dumps(dialects_full, indent=4, sort_keys=False))
+            temp_dir = tempfile.TemporaryDirectory()
+            shutil.move(configuration_path, temp_dir.name)
+            os.rename(conf_path, configuration_path)
+            cleanup_file_list.append(configuration_path)
+
+        for r, d, f in os.walk(module_dir):
+            r_split = r.split(os.sep)
+            if not (len(r_split) >= 3 and ('tests' == r_split[2])):
+                for file in f:
+                    if '.json' in file:
+                        json_include_lines.append('include ' + os.path.join(r, file) + ' \n')
+    with open('MANIFEST.in', 'a', encoding="utf-8") as out_file:
+        out_file.writelines(json_include_lines)
+
+    # Run setup()
+    proc_params = ['python3', 'build_templates/setup_one.py']
+    proc_params.extend(sys.argv[1:])
+    proc_params.append(json.dumps(params))
+    proc = subprocess.Popen(proc_params, stdout=subprocess.PIPE)
+    for line in io.TextIOWrapper(proc.stdout, encoding="utf-8"):
+        if not line:
+            break
+        print(line.rstrip())
+
+    # Cleanup
+    cleanup_file_list.extend(['build', 'MANIFEST.in', project_name + '.egg-info'])
+    for cleanup_file in cleanup_file_list:
+        if os.path.exists(cleanup_file):
+            if os.path.isdir(cleanup_file):
+                shutil.rmtree(cleanup_file)
+            else:
+                os.remove(cleanup_file)
+    if temp_dir is not None:
+        shutil.move(os.path.join(temp_dir.name, 'configuration'), module_dir)
+        temp_dir = None
+    print('---------------------------------')
+shutil.rmtree(TMP_MAPPING_DIR)
